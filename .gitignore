@@ -1,0 +1,10 @@
+*.pyc
+__pycache__/
+/wandb
+checkpoints
+Experiments
+data
+SMPL_python_v.1.0.0
+*.so
+kinpoly/
+build/
