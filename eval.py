@@ -1,374 +1,184 @@
-import sys
-sys.path.append('.')
-sys.path.append('..')
-sys.path.append('./kinpoly')
+"""Evaluate a checkpoint under an explicit, unaligned motion protocol."""
+from __future__ import annotations
 
 import argparse
-import os
+import json
+import math
+import re
 from pathlib import Path
-import yaml
+
 import numpy as np
-import joblib
-import json 
 import torch
-from collections import defaultdict
-from utils.vis.blender_vis_mesh_motion import  run_blender_rendering_and_save2video_head_pose
-from tqdm import tqdm
-# from kinpoly.relive.utils import *
-from kinpoly.scripts.eval_metrics_imu_rec import  compute_metrics_for_smpl
-from trainer import get_trainer  
-from utils.habitat_utils.sample_motion_in_replica import determine_floor_height_and_contacts
-def test(opt, device):
-    # Prepare full body ground truth data. 
-    data_folder = os.path.join(opt.data_root_folder,'egocentric_aist')
-    music_feats_folder = os.path.join(opt.data_root_folder,'aist++/audio_feats')
-    data_split = 'data/egocentric_aist/test_data.txt'
-    test_file_name = np.loadtxt(data_split, dtype=str).tolist()
 
-    # Deine diffusion model 
-    diffusion_trainer = get_trainer(opt, device)
-    diffusion_trainer.ds.parents = diffusion_trainer.ds.parents.to(device)
-    diffusion_trainer.ds.rest_human_offsets = diffusion_trainer.ds.rest_human_offsets.to(device)
-    diffusion_trainer.ds.bm_dict['male'] = diffusion_trainer.ds.bm_dict['male'].to(device)
-    diffusion_trainer.ds.bm_dict['female'] = diffusion_trainer.ds.bm_dict['female'].to(device)
-    diffusion_trainer.load_weight_path(opt.checkpoint)
+from dataset.egoaistpp_dataset import EgoAISTppDataset
+from dataset.cache_integrity import validate_content_checksum
+from dataset.manifest import atomic_json, sha256_file
+from dataset.motion_representation import MotionNormalizer, REPRESENTATION, atomic_save_npz, read_metadata
+from evaluation.motion_metrics import motion_metrics
+from evaluation.mmv import compute_mmv, kinematic_beats
+from infer import load_head_guidance
+from model.factory import load_system_checkpoint
+from model.head_guidance import GUIDANCE_PROTOCOLS
+from trainer import choose_device
+from utils.config import model_protocols
 
-    e_root_list = []
-    o_root_list = []
-    t_root_list = []
-    e_head_list = []
-    o_head_list = []
-    t_head_list = []
-    mpjpe_list = []
-    mpjpe_wo_hand_list = []
-    single_jpe_list = []
 
-    pred_accl_list = []
-    gt_accl_list = [] 
-    accer_list = [] 
-    pred_fs_list = [] 
-    gt_fs_list = [] 
+def metric_denominator(name, metrics):
+    if name.startswith("acceleration_"):
+        return int(metrics["acceleration_frames"])
+    if name == "foot_skating_mm_s":
+        return int(metrics["foot_contact_transitions"])
+    if name in ("mm", "mv", "mmv"):
+        return 1
+    return int(metrics["valid_frames"])
 
-    max_len = 0 
-    with torch.no_grad():
-        for file_name in tqdm(test_file_name):
-            motion_file = os.path.join(data_folder, file_name, 'motion.npz')
-            curr_seq_full_body_data = np.load(motion_file)
 
-            if curr_seq_full_body_data['trans'].shape[0] > max_len:
-                max_len = curr_seq_full_body_data['trans'].shape[0]
+def evaluate(checkpoint_path, manifest_path, output_dir, *, device="cpu", seed=0,
+             floor_height=None, head_estimates_dir=None, guidance_strength=0.01,
+             beat_features_dir=None, beat_sigma_seconds=0.1, use_ema=True,
+             up_axis=2, contact_height_threshold=0.05, guidance_protocol="posterior_log_v1",
+             require_raft_beats=False):
+    if guidance_protocol not in GUIDANCE_PROTOCOLS:
+        raise ValueError("Unknown guidance protocol")
+    if require_raft_beats and beat_features_dir is None:
+        raise ValueError("require_raft_beats requires beat_features_dir")
+    device = choose_device(device)
+    system, checkpoint = load_system_checkpoint(checkpoint_path, device, use_ema=use_ema)
+    config = checkpoint["config"]
+    if not system.feature_contract:
+        raise ValueError("Checkpoint lacks the feature extractor contract")
+    torch.set_num_threads(config["training"].get("cpu_threads", 4))
+    normalization = MotionNormalizer(system.normalizer.mean.detach().cpu(), system.normalizer.std.detach().cpu(),
+                                     system.normalizer.metadata)
+    dataset = EgoAISTppDataset(manifest_path, normalization, window=config["data"]["window"], training=False,
+                              expected_audio_dim=config["conditioning"]["audio_dim"],
+                              expected_video_dim=config["conditioning"]["video_dim"],
+                              expected_feature_contract=system.feature_contract)
+    if any(r["split"] not in ("test", "val") for r in dataset.records):
+        raise ValueError("Evaluation requires a declared test or validation manifest")
+    if len({r["split"] for r in dataset.records}) != 1:
+        raise ValueError("Do not mix validation and test in one report")
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    fps = config["diffusion"].get("fps", 30)
+    if any(record.get("fps") is None or not math.isclose(record["fps"], fps, abs_tol=1e-8) for record in dataset.records):
+        raise ValueError("Evaluation manifest FPS differs from the checkpoint motion rate")
+    frame = config.get("assumptions", {}).get("coordinates", "unspecified")
+    sums, counts, per_window = {}, {}, []
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        sequence_id, start, length = sample["sequence_id"], sample["start_frame"], sample["length"]
+        audio, video, mask = (sample[k][None].to(device) for k in ("audio", "video", "mask"))
+        times = (start + np.arange(length, dtype=np.float64)) / fps
+        guidance = None
+        input_hashes = {}
+        if head_estimates_dir:
+            head_path = Path(head_estimates_dir) / f"{sequence_id}.npz"
+            guidance = load_head_guidance(head_path, times, device,
+                                          sequence_id=sequence_id, coordinate_frame=frame, strength=guidance_strength,
+                                          padded_length=mask.shape[1], protocol=guidance_protocol)
+            input_hashes["head_estimates_sha256"] = sha256_file(head_path)
+        generator = torch.Generator(device=device).manual_seed(seed + index)
+        # No target or target-derived transform is supplied to sampling.
+        prediction = system.sample(audio, video, mask, head_guidance=guidance, generator=generator)
+        target = system.normalizer.denormalize(sample["motion"][None].to(device))
+        metrics = motion_metrics(prediction, target, mask, fps=fps, floor_height=floor_height,
+                                 up_axis=up_axis, contact_height_threshold=contact_height_threshold)
+        values = {name: float(value) for name, value in metrics.items()}
+        values.update(mm=float("nan"), mv=float("nan"), mmv=float("nan"))
+        if beat_features_dir:
+            beat_path = Path(beat_features_dir) / f"{sequence_id}.npz"
+            with np.load(beat_path, allow_pickle=False) as data:
+                metadata = read_metadata(data)
+                if "content_sha256" in metadata:
+                    validate_content_checksum({key: np.array(data[key]) for key in data.files if key != "metadata"}, metadata, beat_path)
+                if metadata.get("source_kind") != "inputs" or metadata.get("sequence_id") != sequence_id:
+                    raise ValueError("Beat references must be extracted from input music/video for this sequence")
+                video_extractor = metadata.get("extractor", {}).get("video", {})
+                if require_raft_beats and (video_extractor.get("backend") != "raft"
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(video_extractor.get("weights_sha256", "")))):
+                    raise ValueError("RAFT beat evaluation requires recorded RAFT backend and pretrained weight hash")
+                music = np.array(data["music_beats_seconds"])
+                vision = np.array(data["video_beats_seconds"])
+            input_hashes["beat_features_sha256"] = sha256_file(beat_path)
+            input_hashes["beat_extractor"] = metadata.get("extractor", {})
+            if any(array.ndim != 1 or not np.isfinite(array).all() or (array < 0).any() for array in (music, vision)):
+                raise ValueError("Beat references must be finite nonnegative timestamps")
+            begin, end = start / fps, (start + length) / fps
+            music = music[(music >= begin) & (music < end)] - begin
+            vision = vision[(vision >= begin) & (vision < end)] - begin
+            positions = prediction[0, :length, :, :3].cpu().numpy()
+            body_beats = kinematic_beats(positions, fps=fps)
+            head_beats = kinematic_beats(positions[:, 15:16], fps=fps)
+            values.update(compute_mmv(body_beats, music, head_beats, vision, sigma_seconds=beat_sigma_seconds))
+        for name, value in values.items():
+            if name in ("valid_frames", "acceleration_frames", "foot_contact_transitions"):
+                continue
+            denominator = metric_denominator(name, metrics)
+            if math.isfinite(value) and denominator:
+                sums[name] = sums.get(name, 0.0) + value * denominator
+                counts[name] = counts.get(name, 0) + denominator
+            else:
+                counts.setdefault(name, 0)
+        metadata = {"schema_version": 1, "sequence_id": sequence_id, "start_frame": start,
+                    "representation": REPRESENTATION, "coordinate_frame": frame,
+                    "checkpoint_sha256": sha256_file(checkpoint_path), "seed": seed + index,
+                    "guidance": "estimated_head" if guidance else "unguided",
+                    "guidance_strength": guidance_strength if guidance else 0.0,
+                    "guidance_protocol": guidance.protocol if guidance else None,
+                    "model_protocols": model_protocols(config),
+                    "weights": "ema" if use_ema else "model", **input_hashes}
+        filename = output / "predictions" / f"{sequence_id}__{start:06d}.npz"
+        atomic_save_npz(filename, motion=prediction[0, :length].cpu().numpy(), timestamps=times,
+                        metadata=np.array(json.dumps(metadata)))
+        per_window.append({"sequence_id": sequence_id, "start_frame": start, "length": length,
+                           "input_hashes": input_hashes,
+                           "metrics": {k: v if math.isfinite(v) else None for k, v in values.items()}})
+    report = {"schema_version": 1, "protocol": "reconstruction_global_unaligned_single_sample_v1",
+              "checkpoint_sha256": sha256_file(checkpoint_path), "manifest_sha256": sha256_file(manifest_path),
+              "weights": "ema" if use_ema else "model", "seed": seed, "fps": fps,
+              "guidance": "estimated_head" if head_estimates_dir else "unguided",
+              "coordinate_frame": frame, "floor_height_m": floor_height,
+              "up_axis": up_axis, "contact_height_threshold_m": contact_height_threshold,
+              "contact_policy": "predicted_feet_near_declared_floor" if floor_height is not None else "unavailable",
+              "guidance_strength": guidance_strength if head_estimates_dir else 0.0,
+              "guidance_protocol": guidance_protocol if head_estimates_dir else None,
+              "model_protocols": model_protocols(config), "require_raft_beats": require_raft_beats,
+              "beat_sigma_seconds": beat_sigma_seconds, "requested_sequences": len(dataset.records),
+              "evaluated_windows": len(per_window), "evaluated_frames": sum(r["length"] for r in per_window),
+              "aggregation": "frame/contact weighted motion metrics; window mean beat agreement; no cross-window derivatives",
+              "metrics": {name: sums[name] / count if count else None for name, count in counts.items()},
+              "denominators": counts, "windows": per_window}
+    atomic_json(output / "metrics.json", report)
+    return report
 
-            seq_name = file_name
-            max_steps = 120 
-            gt_trans = curr_seq_full_body_data['trans'][:max_steps] # T X 3 
-            gt_root_orient = curr_seq_full_body_data['root_orient'][:max_steps] # T X 3 
-            gt_pose_aa = curr_seq_full_body_data['pose_body'][:max_steps] # T X 69
 
-            gt_trans = torch.from_numpy(gt_trans)
-            gt_root_orient = torch.from_numpy(gt_root_orient)
-            gt_pose_aa = torch.from_numpy(gt_pose_aa)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--floor-height", type=float, help="Declared floor height in model coordinates, metres")
+    parser.add_argument("--up-axis", type=int, choices=[0, 1, 2], default=2)
+    parser.add_argument("--contact-height-threshold", type=float, default=0.05)
+    parser.add_argument("--head-estimates-dir")
+    parser.add_argument("--guidance-strength", type=float, default=0.01)
+    parser.add_argument("--guidance-protocol", choices=GUIDANCE_PROTOCOLS, default="posterior_log_v1")
+    parser.add_argument("--require-raft-beats", action="store_true", help="Reject baseline or unversioned video beat caches")
+    parser.add_argument("--beat-features-dir")
+    parser.add_argument("--beat-sigma-seconds", type=float, default=0.1)
+    parser.add_argument("--raw-weights", action="store_true")
+    args = parser.parse_args()
+    report = evaluate(args.checkpoint, args.manifest, args.output_dir, device=args.device, seed=args.seed,
+                      floor_height=args.floor_height, head_estimates_dir=args.head_estimates_dir,
+                      guidance_strength=args.guidance_strength, guidance_protocol=args.guidance_protocol,
+                      require_raft_beats=args.require_raft_beats, beat_features_dir=args.beat_features_dir,
+                      beat_sigma_seconds=args.beat_sigma_seconds, use_ema=not args.raw_weights,
+                      up_axis=args.up_axis, contact_height_threshold=args.contact_height_threshold)
+    print(json.dumps({k: v for k, v in report.items() if k != "windows"}, indent=2))
 
-            curr_gt_smpl_seq_root_trans = gt_trans.float().cuda()
-            curr_gt_smpl_seq_joint_rot_aa = torch.cat((gt_root_orient, gt_pose_aa), dim=-1).reshape(-1, 24, 3).float().cuda()
-
-            # fk to get global head pose 
-            global_jrot, global_jpos = diffusion_trainer.ds.fk_smpl(curr_gt_smpl_seq_root_trans, \
-            curr_gt_smpl_seq_joint_rot_aa)
-            # T X 24 X 4, T X 24 X 3 
-
-            floor_height, _, _ = determine_floor_height_and_contacts(global_jpos.data.cpu().numpy(), fps=30)
-            # print("floor height:{0}".format(floor_height)) 
-            global_jpos[:, :, 2] -= floor_height # Move the human to touch the floor z = 0  
-
-            head_idx = 15 
-            global_head_jpos = global_jpos[:, head_idx, :] # T X 3 
-            global_head_jrot = global_jrot[:, head_idx, :] # T X 4 
-
-            s1_output = defaultdict(list) 
-            s1_output['head_pose'] = torch.cat((global_head_jpos, global_head_jrot), dim=-1)[None] #  1 X T X 7 
-
-            image_file = os.path.join(data_folder, file_name, 'images.npy')
-            image = np.load(image_file) # T X 3 X H X W
-            image = torch.from_numpy(image)[:max_steps].permute(0,3,1,2).unsqueeze(0).float().cuda()
-            audio_file_name = file_name.split("_")[-4] + ".npy"
-            audio_file = os.path.join(music_feats_folder, audio_file_name)
-            audio = np.load(audio_file) # T X 35
-            audio = torch.from_numpy(audio)[:max_steps].unsqueeze(0).float().cuda()
-
-            num_try = 1
-            e_root = None
-            o_root = None
-            t_root = None
-            e_head = None
-            o_head = None
-            t_head = None
-            mpjpe = None
-            single_jpe = None
-
-            best_root_jpos = None 
-            best_local_aa_rep = None 
-            best_head_jpos = None 
-            for try_idx in range(num_try):
-                sample_bs = 1
-                rep_head_pose = s1_output['head_pose'].repeat(sample_bs, 1, 1) # BS X T X 7 
-
-                ori_local_aa_rep, ori_global_root_jpos = \
-                diffusion_trainer.full_body_gen_cond_sliding_window(image, audio, rep_head_pose) 
-
-                # Get global joint positions using fk 
-                pred_fk_jrot, pred_fk_jpos = diffusion_trainer.ds.fk_smpl(ori_global_root_jpos.reshape(-1, 3), \
-                ori_local_aa_rep.reshape(-1, 24, 3))
-                # (BS*T) X 24 X 4, (BS*T) X 24 X 3 
-                pred_fk_jrot = pred_fk_jrot.reshape(sample_bs, -1, 24, 4) # BS X T X 24 X 4 
-                pred_fk_jpos = pred_fk_jpos.reshape(sample_bs, -1, 24, 3) # BS X T X 24 X 3 
-
-                gt_move_trans =  global_jpos[0:1, 15:16, :].clone()[None].repeat(sample_bs, 1, 1, 1) # BS X 1 X 1 X 3 
-                pred_move_trans = pred_fk_jpos[:, 0:1, 15:16, :].clone()  # BS X 1 X 1 X 3 
-
-                gt_move_trans[:, :, :, 2] *= 0
-                pred_move_trans[:, :, :, 2] *= 0 
-
-                rep_global_jpos = global_jpos[None].repeat(sample_bs, 1, 1, 1) - gt_move_trans # BS X T X 24 X 3 
-                pred_fk_jpos = pred_fk_jpos - pred_move_trans # BS X T X 24 X 3 
-               
-                ori_global_root_jpos = pred_fk_jpos[:, :, 0, :].clone() # BS X T X 3 
-                curr_gt_smpl_seq_root_trans = rep_global_jpos[:, :, 0, :].clone() # BS X T X 3 
-
-                curr_metric_dict = None 
-                curr_best_mpjpe = None 
-                curr_best_global_root_pos = None 
-                curr_best_local_aa_rep = None 
-                curr_best_global_head_jpos = None 
-                for s_idx in range(sample_bs):
-                    # Process Predicted data to touch floor z = 0, and move thead init head translation xy to 0. 
-                    pred_floor_height, _, _ = determine_floor_height_and_contacts(pred_fk_jpos[s_idx].data.cpu().numpy(), fps=30)
-                    # print("pred floor height:{0}".format(pred_floor_height))   
-
-                    metric_dict = compute_metrics_for_smpl(global_jrot[:pred_fk_jrot.shape[1]], \
-                    rep_global_jpos[s_idx, :pred_fk_jpos.shape[1]], 0., \
-                    pred_fk_jrot[s_idx], pred_fk_jpos[s_idx], pred_floor_height)
-                
-                    # e_root, o_root, t_root, e_head, o_head, t_head, mpjpe, single_jpe = compute_metrics(body_test_output, "statear", kinpoly_cfg)
-                    curr_e_root = metric_dict['root_dist']
-                    curr_o_root = metric_dict['root_rot_dist']
-                    curr_t_root = metric_dict['root_trans_dist']
-                    curr_e_head = metric_dict['head_dist']
-                    curr_o_head = metric_dict['head_rot_dist']
-                    curr_t_head = metric_dict['head_trans_dist']
-                    curr_mpjpe = metric_dict['mpjpe']
-                    curr_mpjpe_wo_hand = metric_dict['mpjpe_wo_hand']
-                    curr_single_jpe = metric_dict['single_jpe']
-
-                    curr_pred_accl = metric_dict['accel_pred']
-                    curr_gt_accl = metric_dict['accel_gt'] 
-                    curr_accer = metric_dict['accel_err']
-                    curr_pred_fs = metric_dict['pred_fs']
-                    curr_gt_fs = metric_dict['gt_fs']
-
-                    print("Seq name:{0}".format(seq_name))
-                    print("E_root: {0}, O_root: {1}, T_root: {2}".format(curr_e_root, curr_o_root, curr_t_root))
-                    print("E_head: {0}, O_head: {1}, T_head: {2}".format(curr_e_head, curr_o_head, curr_t_head))
-                    print("MPJPE: {0}".format(curr_mpjpe))
-                    print("MPJPE wo Hand: {0}".format(curr_mpjpe_wo_hand))
-                    print("ACCEL pred: {0}".format(curr_pred_accl))
-                    print("ACCEL gt: {0}".format(curr_gt_accl))
-                    print("ACCER: {0}".format(curr_accer))
-                    print("Foot Sliding pred: {0}".format(curr_pred_fs))
-                    print("Foot Sliding gt: {0}".format(curr_gt_fs))
-
-                    curr_head_global_jpos = pred_fk_jpos[s_idx, :, 15, :] # T X 3 
-
-                    if curr_best_mpjpe is None:
-                        curr_best_mpjpe = curr_mpjpe 
-                        curr_metric_dict = metric_dict
-                        curr_best_global_root_pos = ori_global_root_jpos[s_idx]
-                        curr_best_local_aa_rep = ori_local_aa_rep[s_idx]
-                        curr_best_head_global_pos = curr_head_global_jpos 
-
-                    if curr_mpjpe < curr_best_mpjpe:
-                        curr_best_mpjpe = curr_mpjpe 
-                        curr_metric_dict = metric_dict 
-                        curr_best_global_root_pos = ori_global_root_jpos[s_idx]
-                        curr_best_local_aa_rep = ori_local_aa_rep[s_idx]
-                        curr_best_head_global_pos = curr_head_global_jpos 
-
-                    # if opt.gen_vis: 
-                    #     dest_vis_folder = os.path.join(opt.exp_dir, "stage2_vis_on_amass_test_diversity")
-                    #     curr_seq_name = seq_name.replace(" ", "") + "_try_"+ str(s_idx)
-                    #     diffusion_trainer.gen_full_body_vis(ori_global_root_jpos[s_idx], ori_local_aa_rep[s_idx], dest_vis_folder, curr_seq_name)
-
-                if try_idx == 0 or curr_best_mpjpe < mpjpe:
-                    e_root = curr_metric_dict['root_dist']
-                    o_root = curr_metric_dict['root_rot_dist']
-                    t_root = curr_metric_dict['root_trans_dist']
-                    e_head = curr_metric_dict['head_dist']
-                    o_head = curr_metric_dict['head_rot_dist']
-                    t_head = curr_metric_dict['head_trans_dist']
-                    mpjpe = curr_metric_dict['mpjpe']
-                    mpjpe_wo_hand = curr_metric_dict['mpjpe_wo_hand']
-                    single_jpe = curr_metric_dict['single_jpe']
-
-                    pred_accl = curr_metric_dict['accel_pred']
-                    gt_accl = curr_metric_dict['accel_gt'] 
-                    accer = curr_metric_dict['accel_err']
-                    pred_fs = curr_metric_dict['pred_fs']
-                    gt_fs = curr_metric_dict['gt_fs']
-
-                    best_root_jpos = curr_best_global_root_pos 
-                    best_local_aa_rep = curr_best_local_aa_rep
-                    best_head_jpos = curr_best_head_global_pos 
-
-            # if mpjpe < 300:
-            e_root_list.append(e_root)
-            o_root_list.append(o_root)
-            t_root_list.append(t_root)
-            e_head_list.append(e_head)
-            o_head_list.append(o_head)
-            t_head_list.append(t_head)
-            mpjpe_list.append(mpjpe)
-            mpjpe_wo_hand_list.append(mpjpe_wo_hand)
-            single_jpe_list.append(single_jpe)
-
-            pred_accl_list.append(pred_accl)
-            gt_accl_list.append(gt_accl) 
-            accer_list.append(accer)
-            pred_fs_list.append(pred_fs)
-            gt_fs_list.append(gt_fs)
-
-            # continue # Tmp 
-            if opt.gen_vis:
-                vis_head_pose = False    
-
-                dest_vis_folder = os.path.join(opt.exp_dir, "vis_test_24")
-
-                curr_seq_name = seq_name
-
-                mesh_jnts, mesh_verts = diffusion_trainer.gen_full_body_vis(best_root_jpos, best_local_aa_rep, dest_vis_folder, curr_seq_name)
-                mesh_jnts_gt, mesh_verts_gt = diffusion_trainer.gen_full_body_vis(curr_gt_smpl_seq_root_trans.squeeze(0), curr_gt_smpl_seq_joint_rot_aa.squeeze(0), dest_vis_folder, curr_seq_name, vis_gt=True)
-
-                if vis_head_pose:
-                    vis_head_v_idx = 444 
-
-                    align_init_head_trans = mesh_verts[0, 0:1, vis_head_v_idx, :].detach().cpu().numpy() - s1_output['head_pose'][0, 0:1, :3].detach().cpu().numpy() # 1 X 3 
-                    tmp_head_trans = s1_output['head_pose'][0, :, :3].detach().cpu().numpy() + align_init_head_trans # T X 3
-
-                    dest_head_pose_npy_path = os.path.join(dest_vis_folder, curr_seq_name+"_head_pose.npy")
-                    head_save_data = np.concatenate((tmp_head_trans, \
-                    s1_output['head_pose'][0, :, 3:].detach().cpu().numpy()), axis=-1) # T X 7 
-                    np.save(dest_head_pose_npy_path, head_save_data)
-
-                    dest_obj_out_folder = os.path.join(dest_vis_folder, curr_seq_name, "objs")
-                    dest_out_vid_path = os.path.join(dest_vis_folder, curr_seq_name+"_human_w_head_pose.mp4")
-                    run_blender_rendering_and_save2video_head_pose(dest_head_pose_npy_path, dest_obj_out_folder, \
-                    dest_out_vid_path)
-
-                    dest_out_head_only_vid_path = os.path.join(dest_vis_folder, curr_seq_name+"_head_pose_only.mp4")
-                    run_blender_rendering_and_save2video_head_pose(dest_head_pose_npy_path, dest_obj_out_folder, \
-                    dest_out_head_only_vid_path, vis_head_only=True) 
-                
-    e_root_arr = np.asarray(e_root_list)
-    o_root_arr = np.asarray(o_root_list)
-    t_root_arr = np.asarray(t_root_list)
-    e_head_arr = np.asarray(e_head_list)
-    o_head_arr = np.asarray(o_head_list)
-    t_head_arr = np.asarray(t_head_list)
-    mpjpe_arr = np.asarray(mpjpe_list)
-    mpjpe_wo_hand_arr = np.asarray(mpjpe_wo_hand_list)
-    single_jpe_arr = np.asarray(single_jpe_list)
-
-    pred_accl_arr = np.asarray(pred_accl_list)
-    gt_accl_arr = np.asarray(gt_accl_list)
-    accer_arr = np.asarray(accer_list)
-    pred_fs_arr = np.asarray(pred_fs_list)
-    gt_fs_arr = np.asarray(gt_fs_list)
-
-    mean_e_root = e_root_arr.mean()
-    mean_o_root = o_root_arr.mean() 
-    mean_t_root = t_root_arr.mean() 
-    mean_e_head = e_head_arr.mean()
-    mean_o_head = o_head_arr.mean()
-    mean_t_head = t_head_arr.mean()
-    mean_mpjpe = mpjpe_arr.mean()
-    mean_mpjpe_wo_hand = mpjpe_wo_hand_arr.mean()
-    mean_single_jpe = single_jpe_arr.mean(axis=0) # J 
-
-    mean_pred_accl = pred_accl_arr.mean()
-    mean_gt_accl = gt_accl_arr.mean() 
-    mean_accer = accer_arr.mean() 
-    mean_pred_fs = pred_fs_arr.mean() 
-    mean_gt_fs = gt_fs_arr.mean()
-
-    print("****************Full Body Estimator Evaluation Metrics*******************")
-    print("The number of sequences:{0}".format(e_root_arr.shape[0]))
-    print("E_root: {0}, O_root: {1}, T_root: {2}".format(mean_e_root, mean_o_root, mean_t_root))
-    print("E_head: {0}, O_head: {1}, T_head: {2}".format(mean_e_head, mean_o_head, mean_t_head))
-    print("MPJPE: {0}".format(mean_mpjpe))
-    print("MPJPE wo Hand: {0}".format(mean_mpjpe_wo_hand))
-   
-    print("ACCL pred: {0}".format(mean_pred_accl))
-    print("ACCL gt: {0}".format(mean_gt_accl))
-    print("ACCER: {0}".format(mean_accer))
-    print("Foot Sliding pred: {0}".format(mean_pred_fs))
-    print("Foot Sliding gt: {0}".format(mean_gt_fs))
-
-    print("Max seq length:{0}".format(max_len))
-
-    res_dict = {}
-    res_dict['mean_o_root'] = mean_o_root 
-    res_dict['mean_t_root'] = mean_t_root 
-    res_dict['mean_o_head'] = mean_o_head 
-    res_dict['mean_t_head'] = mean_t_head 
-    res_dict['mpjpe'] = mean_mpjpe 
-    res_dict['mean_mpjpe_wo_hand'] = mean_mpjpe_wo_hand 
-
-    res_dict['accl_pred'] = mean_pred_accl 
-    res_dict['accl_gt'] = mean_gt_accl
-    res_dict['accer'] = mean_accer 
-    res_dict['fs_pred'] = mean_pred_fs 
-    res_dict['fs_gt'] = mean_gt_fs 
-    
-    dest_res_path = os.path.join(opt.exp_dir, "res_test.json")
-
-    json.dump(res_dict, open(dest_res_path, 'w'))
-
-def parse_opt():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument('--workers', type=int, default=0, help='the number of workers for data loading')
-    parser.add_argument('--device', default='0', help='cuda device')
-    parser.add_argument('--weight', default='latest')
-    parser.add_argument("--gen_vis", action="store_true")
-    parser.add_argument('--window', type=int, default=120, help='horizon')
-    parser.add_argument('--batch_size', type=int, default=64, help='batch size')
-    parser.add_argument('--learning_rate', type=float, default=2e-4, help='generator_learning_rate')
-
-    # Diffusion model settings
-    parser.add_argument('--n_dec_layers', type=int, default=4, help='the number of decoder layers')
-    parser.add_argument('--n_head', type=int, default=4, help='the number of heads in self-attention')
-    parser.add_argument('--d_k', type=int, default=256, help='the dimension of keys in transformer')
-    parser.add_argument('--d_v', type=int, default=256, help='the dimension of values in transformer')
-    parser.add_argument('--d_model', type=int, default=512, help='the dimension of intermediate representation in transformer')
-    parser.add_argument('--train_num_steps', type=int, default=800000, help='the number of training steps')
-    parser.add_argument('--gradient_accumulate_every', type=int, default=2, help='the number of training steps')
-    parser.add_argument('--save_and_sample_every', type=int, default=1000, help='save interval')
-    parser.add_argument('--use_amp', action="store_true")
-    parser.add_argument('--log_interval', type=int, default=1000, help='log interval')
-    parser.add_argument('--loss_type', type=str, default='l1', help='l1 or l2')
-    parser.add_argument('--objective', type=str, default='pred_x0', help='pred_noise or pred_x0')
-    parser.add_argument('--exp_dir', default='', help='save to project/name')
-    parser.add_argument('--checkpoint', default='', help='save to project/name')
-
-    # For data representation
-    parser.add_argument("--canonicalize_init_head", action="store_true")
-    parser.add_argument("--use_min_max", action="store_true")
-
-    parser.add_argument('--data_root_folder', default='', help='')
-
-    opt = parser.parse_args()
-    return opt
 
 if __name__ == "__main__":
-    opt = parse_opt()
-    device = torch.device(f"cuda:{opt.device}" if torch.cuda.is_available() else "cpu")
-    test(opt, device)
-    
+    main()

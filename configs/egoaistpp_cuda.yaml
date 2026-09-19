@@ -1,0 +1,84 @@
+# Fused Mamba2 with BF16; microbatch 1, effective batch 2.
+schema_version: 1
+experiment: egoaistpp_cuda_reconstruction
+assumptions:
+  status: reconstruction_not_exact_published_run
+  representation: smpl24_global_xyz_rotation6d_v1
+  coordinates: released_scene_coordinates_meters_z_up
+  inverse_tokenizer: overlap_mean
+  temporal_weights: independent_directions
+  audio_features: jukebox_4800_with_verified_timestamps
+  diffusion_target: pred_x0
+  missing_original_settings:
+  - scan_order
+  - ssm_dimensions
+  - residual_layout
+  - loss_weights
+  - training_budget
+  - fusion_wiring
+  - guidance_schedule
+  - raft_checkpoint_and_preprocessing
+model:
+  input_dim: 9
+  embed_dim: 128
+  depth: 8
+  num_joints: 24
+  d_context: 256
+  backend: mamba2
+  d_state: 64
+  headdim: 64
+  expand: 2
+conditioning:
+  fusion_architecture: paper_encoder_v1
+  audio_dim: 4800
+  video_dim: 2048
+  context_dim: 256
+  hidden_dim: 512
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.0
+diffusion:
+  loss_protocol: paper_v1
+  timesteps: 1000
+  objective: pred_x0
+  beta_schedule: cosine
+  loss_type: l1
+  fps: 30
+  alignment_temperature: 0.1
+  loss_weights:
+    position: 1.0
+    velocity: 0.1
+    contact: 1.0
+    consistency: 0.0
+    alignment: 0.01
+data:
+  train_manifest: data/processed/train.prepared.jsonl
+  val_manifest: data/processed/val.prepared.jsonl
+  test_manifest: data/processed/test.prepared.jsonl
+  statistics: data/processed/statistics.npz
+  geometry: data/processed/geometry.npz
+  window: 150
+training:
+  output_dir: Experiments/cuda
+  seed: 42
+  device: cuda
+  batch_size: 1
+  accumulation_steps: 2
+  max_steps: 200000
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.999
+  gradient_clip: 1.0
+  ema_decay: 0.995
+  ema_warmup: 100
+  amp: true
+  num_workers: 0
+  save_every: 1000
+  validate_every: 1000
+  validation_batches: 8
+  log_every: 10
+  deterministic: false
+  cpu_threads: 4
+  amp_dtype: bfloat16

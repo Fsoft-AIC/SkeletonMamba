@@ -1,0 +1,11 @@
+# Audio/video preprocessing dependencies, included by env.sh.
+-r requirements-common.txt
+torchvision==0.20.1
+opencv-python==4.11.0.86
+Pillow==12.3.0
+librosa==0.10.2.post1
+soundfile==0.12.1
+scipy==1.14.1
+scikit-learn==1.5.2
+numba==0.60.0
+soxr==0.5.0.post1

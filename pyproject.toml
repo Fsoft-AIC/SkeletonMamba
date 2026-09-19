@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skeletonmamba"
+version = "0.1.0"
+description = "SkeletonMamba for music- and video-conditioned dance motion estimation"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.5,<2.6", "numpy>=1.24,<2", "PyYAML>=6,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+video = ["torchvision>=0.20,<0.21", "opencv-python>=4.8,<4.12", "Pillow>=10"]
+audio = ["librosa>=0.10,<0.11", "soundfile>=0.12"]
+geometry = ["smplx>=0.1.28"]
+
+[tool.setuptools]
+py-modules = ["train", "trainer", "infer", "eval"]
+
+[tool.setuptools.packages.find]
+include = ["model*", "dataset*", "evaluation*", "utils*", "scripts*"]
+exclude = ["dis_mamba*", "dis_causal_conv1d*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["cuda: requires a CUDA device and the explicitly installed accelerated backend"]

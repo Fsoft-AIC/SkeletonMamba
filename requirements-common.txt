@@ -1,0 +1,5 @@
+# Core dependencies; env.sh installs the CUDA PyTorch wheel first.
+torch==2.5.1
+numpy==1.26.4
+PyYAML==6.0.2
+pytest==8.3.5
